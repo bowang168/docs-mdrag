@@ -12,7 +12,9 @@ AI-first: designed for use from Claude Code, Codex CLI, or the terminal.
 ## Quick Start
 
 ```bash
-pip3 install qdrant-client markdownify beautifulsoup4
+pip3 install -r requirements.txt
+# (or, minimal:)
+# pip3 install qdrant-client pyyaml jieba beautifulsoup4 markdownify
 
 # Add URLs to urls.md, then:
 python3 mdsearch.py fetch      # download → docs/fetched/
@@ -34,7 +36,7 @@ python3 mdsearch.py search "your query"
 
 ```bash
 sudo dnf install python39 python39-pip
-python3.9 -m pip install qdrant-client markdownify beautifulsoup4
+python3.9 -m pip install -r requirements.txt
 python3.9 mdsearch.py ingest
 ```
 

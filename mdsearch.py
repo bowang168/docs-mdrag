@@ -20,16 +20,29 @@ Usage:
 
 # ── 1. IMPORTS & OPTIONAL DEPS ──────────────────────────────────────────────
 
-import json, math, re, sys, os, time, hashlib, uuid, argparse
-from pathlib import Path
+import argparse
+import hashlib
+import json
+import math
+import re
+import sys
+import time
+import uuid
 from collections import Counter
-from urllib.request import urlopen, Request
+from pathlib import Path
+from typing import Optional
 from urllib.error import URLError
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from qdrant_client import QdrantClient, models
 
-# Optional: jieba for CJK tokenization
+try:
+    import yaml
+except ImportError:
+    print("PyYAML not found. Run: pip3 install pyyaml", file=sys.stderr)
+    sys.exit(1)
+
 try:
     import jieba
     jieba.setLogLevel(20)
@@ -37,7 +50,6 @@ try:
 except ImportError:
     HAS_JIEBA = False
 
-# Optional: fetch deps
 try:
     from bs4 import BeautifulSoup
     from markdownify import markdownify as md_convert
@@ -46,21 +58,51 @@ except ImportError:
     HAS_FETCH_DEPS = False
 
 
+# ── Module-level constants ──────────────────────────────────────────────────
+
+UPSERT_BATCH_SIZE = 50
+EMBED_BATCH_SIZE = 16
+MAX_FILENAME_LEN = 200
+HTTP_TIMEOUT_DEFAULT = 30
+EMBED_RETRY_DELAY = 1.0
+SCROLL_BATCH_SIZE = 200
+
+
 # ── 2. CONFIG ────────────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG = "config.yaml"
 
 
+REQUIRED_TOP_FIELDS = ("collection", "db_path", "embedding")
+REQUIRED_EMBEDDING_FIELDS = ("url", "model", "dim")
+
+
 def load_config(path: str = DEFAULT_CONFIG) -> dict:
-    """Load config.yaml. Resolve relative paths to absolute based on config file location."""
-    try:
-        import yaml
-    except ImportError:
-        print("PyYAML not found. Run: pip3 install pyyaml", file=sys.stderr)
-        sys.exit(1)
+    """Load config.yaml. Resolve relative paths to absolute based on config file location.
+
+    Validates required top-level and embedding fields; exits with a clear message
+    if any are missing so the user does not see a downstream KeyError.
+    """
     cfg_path = Path(path).resolve()
     with open(cfg_path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+        cfg = yaml.safe_load(f) or {}
+    if not isinstance(cfg, dict):
+        print(f"[ERROR] config.yaml must be a YAML mapping, got {type(cfg).__name__}",
+              file=sys.stderr)
+        sys.exit(1)
+    for key in REQUIRED_TOP_FIELDS:
+        if key not in cfg:
+            print(f"[ERROR] config.yaml missing required field: {key}", file=sys.stderr)
+            sys.exit(1)
+    embedding = cfg.get("embedding") or {}
+    if not isinstance(embedding, dict):
+        print("[ERROR] config.yaml: 'embedding' must be a mapping", file=sys.stderr)
+        sys.exit(1)
+    for key in REQUIRED_EMBEDDING_FIELDS:
+        if key not in embedding:
+            print(f"[ERROR] config.yaml missing required field: embedding.{key}",
+                  file=sys.stderr)
+            sys.exit(1)
     cfg["_base"] = cfg_path.parent
     return cfg
 
@@ -195,41 +237,75 @@ class BM25Encoder:
 
 # ── 4. EMBED ─────────────────────────────────────────────────────────────────
 
-def embed(text: str, cfg: dict) -> list[float]:
-    """Call Ollama embed API via urllib (no requests dep).
-    Retries once on failure. Raises RuntimeError if Ollama is unreachable.
-    """
+def _embed_request(inputs: list[str], cfg: dict) -> list[list[float]]:
+    """POST to Ollama /api/embed with a list of inputs; retries once on transport error."""
     url = cfg["embedding"]["url"]
     model = cfg["embedding"]["model"]
-    payload = json.dumps({"model": model, "input": text}).encode()
+    payload = json.dumps({"model": model, "input": inputs}).encode()
     req = Request(url, data=payload, headers={"Content-Type": "application/json"})
+    last_err: Exception | None = None
     for attempt in range(2):
         try:
-            with urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read())["embeddings"][0]
-        except URLError as e:
+            with urlopen(req, timeout=HTTP_TIMEOUT_DEFAULT) as resp:
+                body = json.loads(resp.read())
+            embeddings = body.get("embeddings")
+            if not isinstance(embeddings, list) or len(embeddings) != len(inputs):
+                raise RuntimeError(
+                    f"Ollama returned malformed response: expected {len(inputs)} embeddings, "
+                    f"got {type(embeddings).__name__} of length "
+                    f"{len(embeddings) if isinstance(embeddings, list) else 'n/a'}"
+                )
+            return embeddings
+        except (URLError, TimeoutError) as e:
+            last_err = e
             if attempt == 0:
-                time.sleep(1)
+                time.sleep(EMBED_RETRY_DELAY)
                 continue
             raise RuntimeError(f"Ollama unreachable at {url}: {e}") from e
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            raise RuntimeError(f"Ollama returned invalid payload: {e}") from e
+    # Defensive: loop above always returns or raises.
+    raise RuntimeError(f"Embedding failed at {url}: {last_err}")
+
+
+def embed(text: str, cfg: dict) -> list[float]:
+    """Embed a single string. Raises RuntimeError on failure."""
+    return _embed_request([text], cfg)[0]
+
+
+def embed_batch(texts: list[str], cfg: dict, batch_size: int = EMBED_BATCH_SIZE) -> list[list[float]]:
+    """Embed many strings using Ollama's batch API; chunked to avoid huge payloads."""
+    out: list[list[float]] = []
+    for start in range(0, len(texts), batch_size):
+        out.extend(_embed_request(texts[start:start + batch_size], cfg))
+    return out
 
 
 # ── 5. INGEST ────────────────────────────────────────────────────────────────
 
+_FRONTMATTER_END_RE = re.compile(r'\n---[ \t]*(?:\n|$)')
+
+
 def parse_frontmatter(text: str) -> tuple[dict, str]:
-    """Extract YAML frontmatter from markdown. Returns (meta, body)."""
-    import yaml
-    if not text.startswith("---"):
+    """Extract YAML frontmatter from markdown. Returns (meta, body).
+
+    Recognises only a closing ``---`` on its own line, so YAML document separators
+    embedded in frontmatter values do not truncate parsing.
+    """
+    if not text.startswith("---\n") and text.rstrip("\r") != "---":
         return {}, text
-    end = text.find("\n---", 3)
-    if end == -1:
+    m = _FRONTMATTER_END_RE.search(text, 3)
+    if m is None:
         return {}, text
-    fm_text = text[3:end].strip()
-    body = text[end + 4:].lstrip("\n")
+    fm_text = text[3:m.start()].strip()
+    body = text[m.end():].lstrip("\n")
     try:
-        meta = yaml.safe_load(fm_text) or {}
-    except Exception:
-        meta = {}
+        parsed = yaml.safe_load(fm_text)
+    except yaml.YAMLError as e:
+        print(f"[WARN] frontmatter YAML parse error: {e}", file=sys.stderr)
+        parsed = None
+    # Frontmatter that parses to a scalar/list is not usable as metadata.
+    meta = parsed if isinstance(parsed, dict) else {}
     return meta, body
 
 
@@ -237,12 +313,22 @@ def extract_path_meta(path: str, patterns: list[dict]) -> dict:
     """Apply all matching path_meta patterns from config. Returns merged dict."""
     meta = {}
     for rule in patterns:
-        m = re.search(rule["regex"], path)
-        if m:
-            key = rule["key"]
-            fmt = rule.get("format")
-            val = fmt.replace("{1}", m.group(1)) if fmt else m.group(1)
-            meta[key] = val
+        regex = rule.get("regex")
+        key = rule.get("key")
+        if not regex or not key:
+            print(f"[WARN] path_meta rule missing regex/key: {rule}", file=sys.stderr)
+            continue
+        m = re.search(regex, path)
+        if not m:
+            continue
+        if m.groups():
+            captured = m.group(1)
+        else:
+            print(f"[WARN] path_meta regex {regex!r} has no capture group; skipping",
+                  file=sys.stderr)
+            continue
+        fmt = rule.get("format")
+        meta[key] = fmt.replace("{1}", captured) if fmt else captured
     return meta
 
 
@@ -276,7 +362,8 @@ def heading_aware_chunk(text: str, max_chars: int = 1500) -> list[str]:
 def _split_by_size(text: str, max_chars: int) -> list[str]:
     """Fallback: split text into chunks of max_chars on line boundaries."""
     lines = text.splitlines(keepends=True)
-    chunks, current = [], []
+    chunks: list[str] = []
+    current: list[str] = []
     size = 0
     for line in lines:
         if size + len(line) > max_chars and current:
@@ -313,12 +400,56 @@ BM25_MODEL_FILE = ".bm25.json"
 SKIP_PATTERNS = [".db", ".git", "__pycache__", ".DS_Store"]
 
 
+def _scroll_existing_chunks(
+    client: QdrantClient, collection: str, exclude_files: set[str]
+) -> list[str]:
+    """Stream every chunk_text from Qdrant whose source_file is NOT in exclude_files.
+
+    Used to refit BM25 on the full corpus on incremental ingest, so IDF stays
+    accurate as files are added/removed.
+    """
+    chunks: list[str] = []
+    offset = None
+    while True:
+        pts, next_off = client.scroll(
+            collection_name=collection, limit=SCROLL_BATCH_SIZE, offset=offset,
+            with_payload=["chunk_text", "source_file"], with_vectors=False,
+        )
+        for pt in pts:
+            payload = pt.payload or {}
+            if payload.get("source_file") in exclude_files:
+                continue
+            text = payload.get("chunk_text") or ""
+            if text:
+                chunks.append(text)
+        if next_off is None:
+            break
+        offset = next_off
+    return chunks
+
+
+def _delete_file_points(client: QdrantClient, collection: str, source_file: str) -> None:
+    """Delete all points for a given source_file (handles chunk-count shrinkage)."""
+    client.delete(
+        collection_name=collection,
+        points_selector=models.FilterSelector(
+            filter=models.Filter(must=[models.FieldCondition(
+                key="source_file", match=models.MatchValue(value=source_file),
+            )])
+        ),
+    )
+
+
 def cmd_ingest(cfg: dict, rebuild: bool = False):
     """
     Scan configured dirs, chunk markdown, embed, upsert to Qdrant.
 
     Incremental by default: skip files whose SHA-256 hash hasn't changed.
     --rebuild: drops the collection and re-creates from scratch.
+
+    BM25 is refit on the full corpus on every run that has changes, by combining
+    new chunks with surviving chunks scrolled from Qdrant. This keeps IDF accurate
+    after files are added, removed, or shrunk.
     """
     db_path = resolve_path(cfg, cfg["db_path"])
     db_path.mkdir(parents=True, exist_ok=True)
@@ -326,21 +457,20 @@ def cmd_ingest(cfg: dict, rebuild: bool = False):
     bm25_path = db_path / BM25_MODEL_FILE
 
     client = QdrantClient(path=str(db_path))
+    collection = cfg["collection"]
+    chunk_size = cfg.get("chunk_size", 1500)
 
     if rebuild:
-        name = cfg["collection"]
-        if name in [c.name for c in client.get_collections().collections]:
-            client.delete_collection(name)
-            print(f"Dropped collection: {name}")
-        hash_cache = {}
-        bm25 = None
+        if collection in [c.name for c in client.get_collections().collections]:
+            client.delete_collection(collection)
+            print(f"Dropped collection: {collection}")
+        hash_cache: dict = {}
     else:
         hash_cache = json.loads(hash_cache_path.read_text()) if hash_cache_path.exists() else {}
-        bm25 = BM25Encoder.load(str(bm25_path)) if bm25_path.exists() else None
 
     ensure_collection(client, cfg)
 
-    md_files = []
+    md_files: list[Path] = []
     for d in cfg.get("dirs", []):
         dir_path = resolve_path(cfg, d)
         if not dir_path.exists():
@@ -354,8 +484,8 @@ def cmd_ingest(cfg: dict, rebuild: bool = False):
     print(f"Found {len(md_files)} markdown files")
 
     path_meta_rules = cfg.get("path_meta", [])
-    changed_files = []
-    all_chunks_for_bm25 = []
+    changed_files: list[tuple[Path, str, str, str]] = []
+    new_chunks_per_file: list[list[str]] = []
 
     for f in md_files:
         text = f.read_text(encoding="utf-8", errors="replace")
@@ -363,10 +493,10 @@ def cmd_ingest(cfg: dict, rebuild: bool = False):
         rel = str(f.relative_to(cfg["_base"]))
         if hash_cache.get(rel) == file_hash and not rebuild:
             continue
-        changed_files.append((f, rel, text, file_hash))
         _, body = parse_frontmatter(text)
-        for chunk in heading_aware_chunk(body, cfg.get("chunk_size", 1500)):
-            all_chunks_for_bm25.append(chunk)
+        chunks = heading_aware_chunk(body, chunk_size)
+        changed_files.append((f, rel, text, file_hash))
+        new_chunks_per_file.append(chunks)
 
     if not changed_files:
         print("Nothing changed. Index is up to date.")
@@ -375,34 +505,42 @@ def cmd_ingest(cfg: dict, rebuild: bool = False):
 
     print(f"Processing {len(changed_files)} changed files...")
 
-    if rebuild or bm25 is None:
-        print(f"Fitting BM25 on {len(all_chunks_for_bm25)} chunks...")
-        bm25 = BM25Encoder()
-        bm25.fit(all_chunks_for_bm25)
-        bm25.save(str(bm25_path))
+    # Refit BM25 on full corpus: surviving chunks + newly produced chunks.
+    changed_set = {rel for _, rel, _, _ in changed_files}
+    all_chunks_for_bm25: list[str] = []
+    if not rebuild:
+        existing = _scroll_existing_chunks(client, collection, changed_set)
+        all_chunks_for_bm25.extend(existing)
+    for chunks in new_chunks_per_file:
+        all_chunks_for_bm25.extend(chunks)
 
-    collection = cfg["collection"]
+    print(f"Fitting BM25 on {len(all_chunks_for_bm25)} chunks...")
+    bm25 = BM25Encoder()
+    bm25.fit(all_chunks_for_bm25)
+    bm25.save(str(bm25_path))
+
+    # Delete any orphan chunks for changed files (handles shrinkage).
+    if not rebuild:
+        for _, rel, _, _ in changed_files:
+            _delete_file_points(client, collection, rel)
+
     batch: list[models.PointStruct] = []
-    BATCH_SIZE = 50
 
-    def flush():
-        if batch:
-            client.upsert(collection_name=collection, points=batch)
-            batch.clear()
-
-    for f, rel, text, file_hash in changed_files:
-        meta, body = parse_frontmatter(text)
+    for (f, rel, text, file_hash), chunks in zip(changed_files, new_chunks_per_file):
+        if not chunks:
+            hash_cache[rel] = file_hash
+            print(f"  ingested: {rel} (0 chunks)")
+            continue
+        meta, _ = parse_frontmatter(text)
         path_meta = extract_path_meta(rel, path_meta_rules)
-        chunks = heading_aware_chunk(body, cfg.get("chunk_size", 1500))
+        try:
+            dense_vecs = embed_batch(chunks, cfg)
+        except RuntimeError as e:
+            print(f"[ERROR] {e}", file=sys.stderr)
+            sys.exit(1)
 
-        for i, chunk in enumerate(chunks):
-            try:
-                dense_vec = embed(chunk, cfg)
-            except RuntimeError as e:
-                print(f"[ERROR] {e}", file=sys.stderr)
-                sys.exit(1)
+        for i, (chunk, dense_vec) in enumerate(zip(chunks, dense_vecs)):
             sparse_vec = bm25.encode(chunk)
-
             point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{rel}#{i}"))
             payload = {
                 "source_file": rel,
@@ -417,18 +555,20 @@ def cmd_ingest(cfg: dict, rebuild: bool = False):
                    if k not in ("title", "source_url", "tags", "topic")},
             }
 
-            vectors = {"dense": dense_vec}
+            vectors: dict = {"dense": dense_vec}
             if sparse_vec.indices:
                 vectors["bm25"] = sparse_vec
 
             batch.append(models.PointStruct(id=point_id, vector=vectors, payload=payload))
-            if len(batch) >= BATCH_SIZE:
-                flush()
+            if len(batch) >= UPSERT_BATCH_SIZE:
+                client.upsert(collection_name=collection, points=batch)
+                batch = []
 
         hash_cache[rel] = file_hash
         print(f"  ingested: {rel} ({len(chunks)} chunks)")
 
-    flush()
+    if batch:
+        client.upsert(collection_name=collection, points=batch)
 
     hash_cache_path.write_text(json.dumps(hash_cache, ensure_ascii=False, indent=2))
     print("Done. Hash cache updated.")
@@ -437,16 +577,16 @@ def cmd_ingest(cfg: dict, rebuild: bool = False):
 
 # ── 6. SEARCH ────────────────────────────────────────────────────────────────
 
-def build_filter(filters: dict) -> models.Filter | None:
+def build_filter(filters: Optional[dict]) -> Optional[models.Filter]:
     if not filters:
         return None
-    must = [models.FieldCondition(key=k, match=models.MatchValue(value=v))
-            for k, v in filters.items()]
-    return models.Filter(must=must)
+    conditions = [models.FieldCondition(key=k, match=models.MatchValue(value=v))
+                  for k, v in filters.items()]
+    return models.Filter(must=list(conditions))
 
 
 def search(query: str, cfg: dict, mode: str = "hybrid",
-           limit: int = 5, filters: dict = None) -> list[dict]:
+           limit: int = 5, filters: Optional[dict] = None) -> list[dict]:
     """
     Search modes:
       hybrid  — dense prefetch + BM25 prefetch → RRF fusion (default)
@@ -461,7 +601,7 @@ def search(query: str, cfg: dict, mode: str = "hybrid",
     collection = cfg["collection"]
     qdrant_filter = build_filter(filters)
 
-    bm25 = None
+    bm25: Optional[BM25Encoder] = None
     if mode in ("hybrid", "keyword"):
         if bm25_path.exists():
             bm25 = BM25Encoder.load(str(bm25_path))
@@ -472,9 +612,11 @@ def search(query: str, cfg: dict, mode: str = "hybrid",
     results_raw = None
 
     if mode == "keyword":
+        assert bm25 is not None  # guaranteed by branch above
         sparse_vec = bm25.encode(query)
         if not sparse_vec.indices:
-            print("[WARN] Query produced empty BM25 vector; falling back to semantic", file=sys.stderr)
+            print("[WARN] Query produced empty BM25 vector; falling back to semantic",
+                  file=sys.stderr)
             mode = "semantic"
         else:
             results_raw = client.query_points(
@@ -492,13 +634,14 @@ def search(query: str, cfg: dict, mode: str = "hybrid",
         )
 
     if mode == "hybrid":
+        assert bm25 is not None  # guaranteed by branch above
         vec = embed(query, cfg)
         sparse_vec = bm25.encode(query)
         prefetch = [models.Prefetch(query=vec, using="dense",
                                     limit=limit * 3, filter=qdrant_filter)]
         if sparse_vec.indices:
             prefetch.append(models.Prefetch(query=sparse_vec, using="bm25",
-                                             limit=limit * 3, filter=qdrant_filter))
+                                            limit=limit * 3, filter=qdrant_filter))
             fusion = models.FusionQuery(fusion=models.Fusion.RRF)
             results_raw = client.query_points(
                 collection_name=collection, prefetch=prefetch,
@@ -514,7 +657,7 @@ def search(query: str, cfg: dict, mode: str = "hybrid",
     client.close()
     if results_raw is None:
         return []
-    return [{"score": p.score, "payload": p.payload} for p in results_raw.points]
+    return [{"score": p.score, "payload": p.payload or {}} for p in results_raw.points]
 
 
 # ── 7. FETCH ─────────────────────────────────────────────────────────────────
@@ -567,13 +710,15 @@ def cmd_fetch(cfg: dict, force: bool = False, dry_run: bool = False,
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir_resolved = output_dir.resolve()
     from datetime import datetime, timezone
 
     for i, entry in enumerate(entries):
         url = entry["url"]
-        parsed = urlparse(url)
-        clean = parsed.path.strip("/").replace("/", "_").replace(".html", "") or "index"
-        out_file = output_dir / f"{clean}.md"
+        out_file = _safe_output_path(url, output_dir_resolved)
+        if out_file is None:
+            print(f"    [ERROR] refusing unsafe URL path: {url}", file=sys.stderr)
+            continue
 
         if out_file.exists() and not force:
             print(f"  skip (exists): {out_file.name}")
@@ -582,15 +727,15 @@ def cmd_fetch(cfg: dict, force: bool = False, dry_run: bool = False,
         print(f"  [{i+1}/{len(entries)}] {url}")
         try:
             req = Request(url, headers={"User-Agent": user_agent,
-                                         "Accept": "text/html"})
+                                        "Accept": "text/html"})
             with urlopen(req, timeout=timeout) as resp:
                 html = resp.read().decode("utf-8", errors="replace")
-        except Exception as e:
-            print(f"    [ERROR] {e}", file=sys.stderr)
+        except (URLError, TimeoutError, OSError, UnicodeDecodeError) as e:
+            print(f"    [ERROR] fetch failed: {e}", file=sys.stderr)
             continue
 
         soup = BeautifulSoup(html, "html.parser")
-        page_title = soup.title.string.strip() if soup.title else entry["title"]
+        page_title = (soup.title.get_text(strip=True) if soup.title else "") or entry["title"]
         for sel in strip_selectors:
             for tag in soup.select(sel):
                 tag.decompose()
@@ -609,10 +754,43 @@ def cmd_fetch(cfg: dict, force: bool = False, dry_run: bool = False,
     print("Fetch complete.")
 
 
+_UNSAFE_FILENAME_RE = re.compile(r'[^\w\-.]')
+
+
+def sanitize_url_to_filename(url: str, max_len: int = MAX_FILENAME_LEN) -> str:
+    """Derive a safe filename stem from a URL path.
+
+    Strips leading/trailing slashes, replaces path separators with underscores,
+    drops .html, collapses anything outside ``[\\w\\-.]`` to ``_``, then
+    collapses any ``..`` runs (parent-dir literals) and truncates to ``max_len``.
+    Containment under the output dir is still enforced separately by
+    ``_safe_output_path``.
+    """
+    parsed = urlparse(url)
+    raw = parsed.path.strip("/").replace("/", "_")
+    if raw.lower().endswith(".html"):
+        raw = raw[:-5]
+    cleaned = _UNSAFE_FILENAME_RE.sub("_", raw)
+    cleaned = re.sub(r'\.{2,}', '_', cleaned)
+    cleaned = cleaned.strip("._") or "index"
+    return cleaned[:max_len]
+
+
+def _safe_output_path(url: str, output_dir_resolved: Path) -> Optional[Path]:
+    """Build an output path under output_dir, refusing any path that escapes it."""
+    name = sanitize_url_to_filename(url)
+    candidate = (output_dir_resolved / f"{name}.md").resolve()
+    try:
+        candidate.relative_to(output_dir_resolved)
+    except ValueError:
+        return None
+    return candidate
+
+
 # ── 8. CLI ───────────────────────────────────────────────────────────────────
 
 def cmd_stats(cfg: dict):
-    """Print collection stats and BM25 vocab size."""
+    """Print collection stats and BM25 vocab size. Exits non-zero on failure."""
     db_path = resolve_path(cfg, cfg["db_path"])
     client = QdrantClient(path=str(db_path))
     name = cfg["collection"]
@@ -627,38 +805,42 @@ def cmd_stats(cfg: dict):
             bm25 = BM25Encoder.load(str(bm25_path))
             print(f"BM25 vocab : {bm25.vocab_size} tokens")
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error: {e}", file=sys.stderr)
+        client.close()
+        sys.exit(1)
     client.close()
 
 
 def cmd_filters(cfg: dict):
-    """List distinct values for all payload fields."""
+    """List distinct values for all payload fields, streaming to bound memory."""
     db_path = resolve_path(cfg, cfg["db_path"])
     client = QdrantClient(path=str(db_path))
     name = cfg["collection"]
-    fields = PAYLOAD_INDEXES + list({r["key"] for r in cfg.get("path_meta", [])})
-    payloads = []
+    fields = sorted(set(PAYLOAD_INDEXES) | {r["key"] for r in cfg.get("path_meta", [])
+                                            if r.get("key")})
+    vals: dict[str, set[str]] = {f: set() for f in fields}
     offset = None
     while True:
-        pts, next_off = client.scroll(collection_name=name, limit=200,
-                                       offset=offset, with_payload=fields,
-                                       with_vectors=False)
-        payloads.extend(p.payload for p in pts)
+        pts, next_off = client.scroll(
+            collection_name=name, limit=SCROLL_BATCH_SIZE, offset=offset,
+            with_payload=fields, with_vectors=False,
+        )
+        for pt in pts:
+            payload = pt.payload or {}
+            for field in fields:
+                v = payload.get(field)
+                if v is None or v == "":
+                    continue
+                if isinstance(v, list):
+                    vals[field].update(str(x) for x in v)
+                else:
+                    vals[field].add(str(v))
         if next_off is None:
             break
         offset = next_off
-    for field in sorted(set(fields)):
-        vals = set()
-        for p in payloads:
-            v = p.get(field)
-            if v is None:
-                continue
-            if isinstance(v, list):
-                vals.update(str(x) for x in v)
-            else:
-                vals.add(str(v))
-        if vals:
-            print(f"{field}: {', '.join(sorted(vals))}")
+    for field in fields:
+        if vals[field]:
+            print(f"{field}: {', '.join(sorted(vals[field]))}")
     client.close()
 
 
@@ -707,10 +889,22 @@ def main():
         cmd_ingest(cfg, rebuild=args.rebuild)
 
     elif args.cmd == "search":
-        filters = {}
+        filters: dict = {}
         if args.filter:
+            allowed_keys = set(PAYLOAD_INDEXES) | {
+                r["key"] for r in cfg.get("path_meta", []) if r.get("key")
+            }
             for f in args.filter:
+                if "=" not in f:
+                    print(f"[ERROR] --filter must be KEY=VALUE, got: {f!r}",
+                          file=sys.stderr)
+                    sys.exit(2)
                 k, v = f.split("=", 1)
+                k = k.strip()
+                if k not in allowed_keys:
+                    print(f"[ERROR] unknown filter key {k!r}; allowed: "
+                          f"{', '.join(sorted(allowed_keys))}", file=sys.stderr)
+                    sys.exit(2)
                 filters[k] = v
         results = search(args.query, cfg, mode=args.mode,
                          limit=args.limit, filters=filters or None)

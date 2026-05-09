@@ -4,8 +4,13 @@ description: >
   Search a local markdown knowledge base using hybrid vector + BM25 search.
   Wraps mdsearch.py in ~/g/local-mdsearch (or any configured path).
 triggers:
-  - /mdsearch
-  - phrases: "search my docs", "search local docs", "check local kb", "local knowledge base"
+  commands:
+    - /mdsearch
+  phrases:
+    - "search my docs"
+    - "search local docs"
+    - "check local kb"
+    - "local knowledge base"
 ---
 
 # mdsearch
@@ -17,7 +22,7 @@ Engine: Qdrant local mode + Ollama embeddings + BM25 sparse vectors.
 
 ```bash
 # 1. Install deps
-pip3 install qdrant-client markdownify beautifulsoup4
+pip3 install -r requirements.txt
 
 # 2. Start Ollama + pull model
 ollama serve &

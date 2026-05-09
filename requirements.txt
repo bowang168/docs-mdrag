@@ -1,0 +1,13 @@
+# Core
+qdrant-client>=1.9,<2.0
+pyyaml>=6.0,<7.0
+
+# CJK tokenization (recommended; falls back to regex if absent)
+jieba>=0.42
+
+# Fetch subcommand
+beautifulsoup4>=4.12
+markdownify>=0.11
+
+# Test
+pytest>=8.0
