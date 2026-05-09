@@ -27,13 +27,15 @@ import math
 import re
 import ssl
 import sys
+import threading
 import time
 import uuid
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 from urllib.error import URLError
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from qdrant_client import QdrantClient, models
@@ -67,6 +69,19 @@ MAX_FILENAME_LEN = 200
 HTTP_TIMEOUT_DEFAULT = 30
 EMBED_RETRY_DELAY = 1.0
 SCROLL_BATCH_SIZE = 200
+MAX_SUB_PAGES = 100
+MIN_PAGE_BODY_CHARS = 30  # markdown shorter than this is considered empty boilerplate
+DEFAULT_FETCH_WORKERS = 6
+DEFAULT_FETCH_DELAY = 0.0       # seconds between top-level requests per worker
+DEFAULT_FETCH_CRAWL_DELAY = 0.0  # seconds between sub-pages within a rel=next chain
+
+DEFAULT_STRIP_SELECTORS = [
+    "nav", "header", "footer", "aside", "script", "style", "noscript",
+    ".breadcrumb", ".breadcrumbs", ".sidebar", ".toc", "#toc", "#sidebar",
+    ".header-nav", ".footer-nav", ".cookie-banner", "#cookie-banner",
+    ".feedback", ".feedback-section", "#feedback", ".copyright",
+    ".book-nav", ".navigation", ".nav-bar",
+]
 
 
 def _build_ssl_context() -> ssl.SSLContext:
@@ -680,13 +695,200 @@ def search(query: str, cfg: dict, mode: str = "hybrid",
 
 # ── 7. FETCH ─────────────────────────────────────────────────────────────────
 
+def _fetch_html(url: str, timeout: int, user_agent: str) -> tuple[str, str, str]:
+    """Fetch one URL. Returns ``(html, content_type, final_url)``; on failure
+    returns ``("", "", url)`` so the caller can decide how to recover."""
+    req = Request(url, headers={"User-Agent": user_agent,
+                                "Accept": "text/html,application/xhtml+xml"})
+    try:
+        with urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+            ctype = resp.headers.get("Content-Type", "") or ""
+            return html, ctype, resp.url or url
+    except (URLError, TimeoutError, OSError, UnicodeDecodeError) as e:
+        print(f"    [ERROR] fetch failed: {url}: {e}", file=sys.stderr)
+        return "", "", url
+
+
+def _html_to_markdown(html: str, strip_selectors: list[str]) -> tuple[str, str]:
+    """Pick the main content area, strip chrome, convert to Markdown.
+    Returns ``(page_title, markdown)``."""
+    soup = BeautifulSoup(html, "html.parser")
+    page_title = (soup.title.get_text(strip=True) if soup.title else "") or ""
+
+    main = (
+        soup.find("div", id="content")
+        or soup.find("div", class_="book-body")
+        or soup.find("div", class_="chapter")
+        or soup.find("div", class_="article")
+        or soup.find("article")
+        or soup.find("main")
+        or soup.find("div", class_="content")
+        or soup.find("body")
+        or soup
+    )
+
+    for tag in main.find_all(["nav", "header", "footer", "aside",
+                              "script", "style", "noscript"]):
+        tag.decompose()
+    for sel in strip_selectors:
+        for el in main.select(sel):
+            el.decompose()
+
+    markdown = md_convert(
+        str(main), heading_style="ATX", bullets="-",
+        strip=["img", "svg", "input", "button", "form", "iframe"],
+    )
+    markdown = re.sub(r'\n{4,}', '\n\n\n', markdown).strip()
+    return page_title, markdown
+
+
+class _ThreadSafeSet:
+    """Minimal thread-safe set with atomic add-if-absent for cross-book dedup."""
+
+    def __init__(self) -> None:
+        self._set: set = set()
+        self._lock = threading.Lock()
+
+    def add_if_absent(self, item: str) -> bool:
+        """Atomically claim ownership of ``item``. Returns True if newly added,
+        False if it was already present (i.e. another worker claimed it)."""
+        with self._lock:
+            if item in self._set:
+                return False
+            self._set.add(item)
+            return True
+
+
+def _discover_rel_next(start_url: str, first_html: str,
+                       fetched_global: _ThreadSafeSet,
+                       timeout: int, user_agent: str,
+                       crawl_delay: float) -> list[tuple[str, str]]:
+    """Follow ``<link rel="next">`` from ``<head>`` to walk a multi-page book.
+
+    Returns ``[(url, html), ...]`` starting with the entry page. Stays under
+    the entry URL's base directory, dedupes against ``fetched_global`` so the
+    same chapter is not re-downloaded across overlapping book entries, and
+    caps at ``MAX_SUB_PAGES`` for safety.
+    """
+    start_clean = start_url.rstrip("/")
+    pages: list[tuple[str, str]] = [(start_url, first_html)]
+    seen = {start_clean}
+    fetched_global.add_if_absent(start_clean)
+
+    base_dir = urlparse(start_url).path.rstrip("/") + "/"
+    current_url, current_html = start_url, first_html
+
+    while len(pages) < MAX_SUB_PAGES:
+        soup = BeautifulSoup(current_html, "html.parser")
+        nxt = soup.find("link", rel="next")
+        href = nxt.get("href") if nxt else None
+        if not href:
+            break
+
+        next_url = urljoin(current_url, href)
+        parsed = urlparse(next_url)
+        next_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        clean = next_url.rstrip("/")
+
+        if clean in seen:
+            break
+        if not parsed.path.startswith(base_dir):
+            break  # rel=next escaping the book scope; stop
+        if not fetched_global.add_if_absent(clean):
+            break  # another worker already claimed this sub-page
+
+        if crawl_delay > 0:
+            time.sleep(crawl_delay)
+        html, _, _ = _fetch_html(next_url, timeout, user_agent)
+        if not html:
+            break
+
+        pages.append((next_url, html))
+        seen.add(clean)
+        current_url, current_html = next_url, html
+
+    return pages
+
+
+def _fetch_one_book(
+    idx: int, total: int, entry: dict, *,
+    output_dir_resolved: Path, base_dir: Path,
+    subfolder_rules: list[dict], strip_selectors: list[str],
+    timeout: int, user_agent: str, crawl_delay: float, delay: float,
+    force: bool, fetched_global: _ThreadSafeSet, print_lock: threading.Lock,
+) -> None:
+    """Worker: process one top-level URL — fetch + crawl + convert + write."""
+    from datetime import datetime, timezone
+
+    url = entry["url"]
+    subfolder = classify_url(url, subfolder_rules)
+    out_file = _safe_output_path(url, output_dir_resolved, subfolder=subfolder)
+    if out_file is None:
+        with print_lock:
+            print(f"  [{idx}/{total}] [ERROR] refusing unsafe URL path: {url}",
+                  file=sys.stderr)
+        return
+
+    if out_file.exists() and not force:
+        with print_lock:
+            print(f"  [{idx}/{total}] skip (exists): "
+                  f"{out_file.relative_to(output_dir_resolved)}")
+        return
+
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if delay > 0:
+        time.sleep(delay)
+
+    html, _, final_url = _fetch_html(url, timeout, user_agent)
+    if not html:
+        return  # _fetch_html already logged
+
+    pages = _discover_rel_next(final_url, html, fetched_global,
+                               timeout, user_agent, crawl_delay)
+
+    page_title = entry["title"]
+    parts: list[str] = []
+    for purl, phtml in pages:
+        ptitle, pmd = _html_to_markdown(phtml, strip_selectors)
+        if not parts and ptitle:
+            page_title = ptitle
+        if not pmd or len(pmd) < MIN_PAGE_BODY_CHARS:
+            continue
+        if parts:
+            parts.append(f"\n\n---\n<!-- page: {purl} -->\n\n{pmd}")
+        else:
+            parts.append(pmd)
+
+    markdown = "\n".join(parts).strip()
+    if not markdown:
+        with print_lock:
+            print(f"  [{idx}/{total}] [WARN] no extractable content: {url}",
+                  file=sys.stderr)
+        return
+
+    fetched_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    frontmatter = (
+        f"---\ntitle: {json.dumps(page_title)}\n"
+        f"source_url: {url}\nfetched: {fetched_ts}\n"
+        f"page_count: {len(pages)}\n---\n\n"
+    )
+    out_file.write_text(frontmatter + markdown, encoding="utf-8")
+    with print_lock:
+        print(f"  [{idx}/{total}] saved: {out_file.relative_to(base_dir)} "
+              f"({len(pages)} pages, {len(markdown):,} chars)")
+
+
 def cmd_fetch(cfg: dict, force: bool = False, dry_run: bool = False,
               limit: int | None = None, filter_str: str | None = None):
     """
-    Read urls.md, fetch each URL, convert HTML → Markdown, save to output_dir.
+    Read urls.md, fetch each URL (and its rel="next" chain for multi-page docs),
+    convert HTML → Markdown, save to output_dir. Top-level URLs are fetched
+    concurrently using ``fetch.max_workers`` workers (default 6); rel=next
+    chains stay sequential per book because each chapter URL is only known
+    after the previous chapter is downloaded.
 
-    Saved filename: sanitize URL path (/ → _, strip leading slash + .html).
-    Frontmatter added: title, source_url, fetched timestamp.
     Skip already-saved files unless --force.
     """
     if not HAS_FETCH_DEPS:
@@ -696,10 +898,13 @@ def cmd_fetch(cfg: dict, force: bool = False, dry_run: bool = False,
     fetch_cfg = cfg.get("fetch", {})
     urls_file = resolve_path(cfg, fetch_cfg.get("urls_file", "urls.md"))
     output_dir = resolve_path(cfg, fetch_cfg.get("output_dir", "docs/fetched/"))
-    delay = fetch_cfg.get("delay", 1.5)
-    timeout = fetch_cfg.get("timeout", 30)
+    delay = float(fetch_cfg.get("delay", DEFAULT_FETCH_DELAY))
+    crawl_delay = float(fetch_cfg.get("crawl_delay", DEFAULT_FETCH_CRAWL_DELAY))
+    timeout = int(fetch_cfg.get("timeout", HTTP_TIMEOUT_DEFAULT))
     user_agent = fetch_cfg.get("user_agent", "mdsearch/1.0")
-    strip_selectors = fetch_cfg.get("strip_selectors", ["nav", "header", "footer"])
+    strip_selectors = fetch_cfg.get("strip_selectors", DEFAULT_STRIP_SELECTORS)
+    subfolder_rules = fetch_cfg.get("subfolder_rules", [])
+    max_workers = max(1, int(fetch_cfg.get("max_workers", DEFAULT_FETCH_WORKERS)))
 
     if not urls_file.exists():
         print(f"urls.md not found at {urls_file}. Create it with [title](url) links.")
@@ -707,8 +912,8 @@ def cmd_fetch(cfg: dict, force: bool = False, dry_run: bool = False,
 
     link_re = re.compile(r'\[([^\]]+)\]\((https?://[^\)]+)\)')
     text = urls_file.read_text(encoding="utf-8")
-    entries = []
-    seen = set()
+    entries: list[dict] = []
+    seen: set[str] = set()
     for m in link_re.finditer(text):
         url = m.group(2).strip().rstrip("/")
         if url in seen:
@@ -721,7 +926,8 @@ def cmd_fetch(cfg: dict, force: bool = False, dry_run: bool = False,
     if limit:
         entries = entries[:limit]
 
-    print(f"Found {len(entries)} URLs to fetch")
+    print(f"Found {len(entries)} URLs to fetch (workers={max_workers}, "
+          f"delay={delay}s, crawl_delay={crawl_delay}s)")
     if dry_run:
         for e in entries:
             print(f"  {e['url']}")
@@ -729,47 +935,34 @@ def cmd_fetch(cfg: dict, force: bool = False, dry_run: bool = False,
 
     output_dir.mkdir(parents=True, exist_ok=True)
     output_dir_resolved = output_dir.resolve()
-    from datetime import datetime, timezone
+    base_dir = cfg["_base"]
 
-    for i, entry in enumerate(entries):
-        url = entry["url"]
-        out_file = _safe_output_path(url, output_dir_resolved)
-        if out_file is None:
-            print(f"    [ERROR] refusing unsafe URL path: {url}", file=sys.stderr)
-            continue
+    fetched_global = _ThreadSafeSet()
+    print_lock = threading.Lock()
+    total = len(entries)
+    started = time.monotonic()
 
-        if out_file.exists() and not force:
-            print(f"  skip (exists): {out_file.name}")
-            continue
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="fetch") as ex:
+        futures = [
+            ex.submit(
+                _fetch_one_book, i + 1, total, entry,
+                output_dir_resolved=output_dir_resolved, base_dir=base_dir,
+                subfolder_rules=subfolder_rules, strip_selectors=strip_selectors,
+                timeout=timeout, user_agent=user_agent,
+                crawl_delay=crawl_delay, delay=delay,
+                force=force, fetched_global=fetched_global, print_lock=print_lock,
+            )
+            for i, entry in enumerate(entries)
+        ]
+        for f in as_completed(futures):
+            try:
+                f.result()
+            except Exception as e:
+                with print_lock:
+                    print(f"  [ERROR] worker raised: {e}", file=sys.stderr)
 
-        print(f"  [{i+1}/{len(entries)}] {url}")
-        try:
-            req = Request(url, headers={"User-Agent": user_agent,
-                                        "Accept": "text/html"})
-            with urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as resp:
-                html = resp.read().decode("utf-8", errors="replace")
-        except (URLError, TimeoutError, OSError, UnicodeDecodeError) as e:
-            print(f"    [ERROR] fetch failed: {e}", file=sys.stderr)
-            continue
-
-        soup = BeautifulSoup(html, "html.parser")
-        page_title = (soup.title.get_text(strip=True) if soup.title else "") or entry["title"]
-        for sel in strip_selectors:
-            for tag in soup.select(sel):
-                tag.decompose()
-        main = soup.find("main") or soup.find("article") or soup.find("body") or soup
-        markdown = md_convert(str(main), heading_style="ATX", bullets="-")
-
-        fetched_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        frontmatter = (f"---\ntitle: {json.dumps(page_title)}\n"
-                       f"source_url: {url}\nfetched: {fetched_ts}\n---\n\n")
-        out_file.write_text(frontmatter + markdown, encoding="utf-8")
-        print(f"    saved: {out_file.relative_to(cfg['_base'])} ({len(markdown)} chars)")
-
-        if i < len(entries) - 1:
-            time.sleep(delay)
-
-    print("Fetch complete.")
+    elapsed = time.monotonic() - started
+    print(f"Fetch complete in {elapsed:.1f}s.")
 
 
 _UNSAFE_FILENAME_RE = re.compile(r'[^\w\-.]')
@@ -794,15 +987,42 @@ def sanitize_url_to_filename(url: str, max_len: int = MAX_FILENAME_LEN) -> str:
     return cleaned[:max_len]
 
 
-def _safe_output_path(url: str, output_dir_resolved: Path) -> Optional[Path]:
-    """Build an output path under output_dir, refusing any path that escapes it."""
+def _safe_output_path(url: str, output_dir_resolved: Path,
+                      subfolder: str = "") -> Optional[Path]:
+    """Build an output path under output_dir, refusing any path that escapes it.
+
+    ``subfolder`` is appended after sanitization so configured bucketing rules
+    cannot smuggle ``..`` segments. Unsafe candidates (parent escape via symlink,
+    odd separators) return None.
+    """
     name = sanitize_url_to_filename(url)
-    candidate = (output_dir_resolved / f"{name}.md").resolve()
+    safe_sub = ""
+    if subfolder:
+        safe_sub = _UNSAFE_FILENAME_RE.sub("_", subfolder).strip("._")
+    target_dir = (output_dir_resolved / safe_sub) if safe_sub else output_dir_resolved
+    candidate = (target_dir / f"{name}.md").resolve()
     try:
         candidate.relative_to(output_dir_resolved)
     except ValueError:
         return None
     return candidate
+
+
+def classify_url(url: str, rules: list[dict]) -> str:
+    """Map URL to a subfolder by matching the first rule whose regex hits its path.
+
+    Each rule is ``{"regex": "...", "folder": "..."}``. Returns ``""`` if no
+    rule matches, in which case the file goes to the root output_dir.
+    """
+    path = urlparse(url).path
+    for rule in rules:
+        regex = rule.get("regex")
+        folder = rule.get("folder")
+        if not regex or not folder:
+            continue
+        if re.search(regex, path):
+            return folder
+    return ""
 
 
 # ── 8. CLI ───────────────────────────────────────────────────────────────────

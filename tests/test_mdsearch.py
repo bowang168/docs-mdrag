@@ -277,6 +277,62 @@ class TestLoadConfig:
             mdsearch.load_config(str(p))
 
 
+# ── classify_url ────────────────────────────────────────────────────────────
+
+class TestClassifyUrl:
+    rules = [
+        {"regex": r"/uek/", "folder": "uek"},
+        {"regex": r"/oracle-linux/9/", "folder": "ol9"},
+        {"regex": r"/oracle-linux/", "folder": "shared"},
+    ]
+
+    def test_first_match_wins(self):
+        assert mdsearch.classify_url(
+            "https://docs.oracle.com/en/operating-systems/oracle-linux/9/network/",
+            self.rules,
+        ) == "ol9"
+
+    def test_falls_back_to_later_rule(self):
+        assert mdsearch.classify_url(
+            "https://docs.oracle.com/en/operating-systems/oracle-linux/openssh/",
+            self.rules,
+        ) == "shared"
+
+    def test_uek_branch(self):
+        assert mdsearch.classify_url(
+            "https://docs.oracle.com/en/operating-systems/uek/8/relnotes8.0/",
+            self.rules,
+        ) == "uek"
+
+    def test_no_rules_yields_empty(self):
+        assert mdsearch.classify_url("https://example.com/foo", []) == ""
+
+    def test_no_match_yields_empty(self):
+        assert mdsearch.classify_url("https://other.com/bar", self.rules) == ""
+
+    def test_skips_malformed_rule(self):
+        bad = [{"regex": "/x/"}, {"folder": "y"}, {"regex": r"/z/", "folder": "zz"}]
+        assert mdsearch.classify_url("https://x.com/z/", bad) == "zz"
+
+
+# ── _safe_output_path with subfolder ────────────────────────────────────────
+
+class TestSafeOutputPathSubfolder:
+    def test_subfolder_appended(self, tmp_path):
+        out = mdsearch._safe_output_path(
+            "https://docs.oracle.com/en/operating-systems/oracle-linux/9/network/",
+            tmp_path, subfolder="ol9")
+        assert out is not None
+        assert out.parent == tmp_path / "ol9"
+
+    def test_subfolder_with_dotdot_is_sanitized(self, tmp_path):
+        out = mdsearch._safe_output_path(
+            "https://x.com/foo", tmp_path, subfolder="../escape")
+        assert out is not None
+        # `..` is collapsed to `_`, so target stays under tmp_path
+        assert str(out).startswith(str(tmp_path))
+
+
 # ── build_filter ────────────────────────────────────────────────────────────
 
 class TestBuildFilter:

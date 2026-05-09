@@ -38,15 +38,35 @@ path_meta:
 fetch:
   urls_file: urls.md          # markdown file containing [title](url) links
   output_dir: docs/fetched/   # where fetched markdown is saved (under docs/)
-  delay: 1.5                  # seconds between HTTP requests (be polite)
+  max_workers: 6              # concurrent top-level URL workers (1 = sequential)
+  delay: 0                    # extra wait per worker before each top-level fetch
+  crawl_delay: 0              # wait between sub-pages within a rel=next chain
   timeout: 30                 # HTTP timeout in seconds
   user_agent: "mdsearch/1.0 local-search-tool"
-  # Selectors to strip from fetched HTML before markdown conversion
-  # (navigation, footers, cookie banners, etc.)
-  strip_selectors:
-    - "nav"
-    - "header"
-    - "footer"
-    - ".breadcrumb"
-    - ".feedback"
-    - "#cookie-banner"
+
+  # Selectors to strip from fetched HTML before markdown conversion.
+  # Omit to use the built-in defaults (DEFAULT_STRIP_SELECTORS in mdsearch.py),
+  # which already covers nav/header/footer/aside/script/style/breadcrumb/sidebar/
+  # toc/cookie-banner/feedback/copyright. Define this list only to override.
+
+  # Bucket fetched files into subfolders by URL path.
+  # First matching rule wins; URLs that match nothing land flat under output_dir.
+  # The resulting subfolder shows up in the saved file's path so path_meta
+  # rules below can extract metadata like ol_version / product.
+  subfolder_rules:
+    - regex: '/uek/'
+      folder: uek
+    - regex: '/oracle-linux/10/'
+      folder: ol10
+    - regex: '/oracle-linux/9/'
+      folder: ol9
+    - regex: '/oracle-linux/8/'
+      folder: ol8
+    - regex: '/oracle-linux-automation-manager'
+      folder: olam
+    - regex: '/oracle-linux-manager'
+      folder: olm
+    - regex: '/olcne'
+      folder: olcne
+    - regex: '/oracle-linux/'  # cross-version Oracle Linux pages (no version segment)
+      folder: shared
