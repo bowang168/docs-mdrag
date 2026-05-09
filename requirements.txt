@@ -9,5 +9,9 @@ jieba>=0.42
 beautifulsoup4>=4.12
 markdownify>=0.11
 
+# Trusted CA bundle for HTTPS — required on macOS python.org Python which
+# does not trust the system keychain. Auto-detected at runtime if installed.
+certifi>=2024.2.2
+
 # Test
 pytest>=8.0

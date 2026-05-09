@@ -25,6 +25,7 @@ import hashlib
 import json
 import math
 import re
+import ssl
 import sys
 import time
 import uuid
@@ -66,6 +67,23 @@ MAX_FILENAME_LEN = 200
 HTTP_TIMEOUT_DEFAULT = 30
 EMBED_RETRY_DELAY = 1.0
 SCROLL_BATCH_SIZE = 200
+
+
+def _build_ssl_context() -> ssl.SSLContext:
+    """SSL context that prefers certifi's CA bundle if installed.
+
+    macOS python.org installations do not trust the system keychain, so HTTPS
+    fetches fail with CERTIFICATE_VERIFY_FAILED. Falling back to certifi gives
+    a working bundle without disabling verification.
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+_SSL_CONTEXT = _build_ssl_context()
 
 
 # ── 2. CONFIG ────────────────────────────────────────────────────────────────
@@ -246,7 +264,7 @@ def _embed_request(inputs: list[str], cfg: dict) -> list[list[float]]:
     last_err: Exception | None = None
     for attempt in range(2):
         try:
-            with urlopen(req, timeout=HTTP_TIMEOUT_DEFAULT) as resp:
+            with urlopen(req, timeout=HTTP_TIMEOUT_DEFAULT, context=_SSL_CONTEXT) as resp:
                 body = json.loads(resp.read())
             embeddings = body.get("embeddings")
             if not isinstance(embeddings, list) or len(embeddings) != len(inputs):
@@ -728,7 +746,7 @@ def cmd_fetch(cfg: dict, force: bool = False, dry_run: bool = False,
         try:
             req = Request(url, headers={"User-Agent": user_agent,
                                         "Accept": "text/html"})
-            with urlopen(req, timeout=timeout) as resp:
+            with urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as resp:
                 html = resp.read().decode("utf-8", errors="replace")
         except (URLError, TimeoutError, OSError, UnicodeDecodeError) as e:
             print(f"    [ERROR] fetch failed: {e}", file=sys.stderr)
