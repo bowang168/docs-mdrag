@@ -1,0 +1,52 @@
+# local-mdsearch configuration
+# Paths are relative to this file unless they start with / or ~
+
+# Qdrant collection name — change this if you run multiple instances
+collection: my_docs
+
+# Local Qdrant DB directory (always gitignored)
+db_path: .db/
+
+# Ollama embedding settings
+embedding:
+  url: http://localhost:11434/api/embed
+  model: qwen3-embedding:0.6b
+  dim: 1024                     # must match the model's output dimension
+
+# Max characters per chunk (heading-aware splitter respects headings first)
+chunk_size: 1500
+
+# Directories to index (relative to this file, or absolute)
+# Multiple dirs are merged into one collection
+dirs:
+  - docs/
+
+# Metadata extracted from file paths via Python regex.
+# Rules applied in order; ALL matching rules are applied (not first-match-only).
+# regex: must have exactly one capturing group
+# key:   payload field name stored in Qdrant
+# format: optional template; use {1} for the captured group value.
+#         Omit to use the captured value directly.
+path_meta:
+  - regex: '/ol(\d+)/'
+    key: ol_version
+    format: "ol{1}"           # e.g. path contains /ol9/ → ol_version = "ol9"
+  - regex: '/(uek|olam|olcne|olm|shared)/'
+    key: product              # captured value used directly
+
+# Fetch subcommand settings
+fetch:
+  urls_file: urls.md          # markdown file containing [title](url) links
+  output_dir: docs/fetched/   # where fetched markdown is saved (under docs/)
+  delay: 1.5                  # seconds between HTTP requests (be polite)
+  timeout: 30                 # HTTP timeout in seconds
+  user_agent: "mdsearch/1.0 local-search-tool"
+  # Selectors to strip from fetched HTML before markdown conversion
+  # (navigation, footers, cookie banners, etc.)
+  strip_selectors:
+    - "nav"
+    - "header"
+    - "footer"
+    - ".breadcrumb"
+    - ".feedback"
+    - "#cookie-banner"
